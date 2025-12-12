@@ -148,3 +148,18 @@ export type {
   DebugMiddleware,
   AttachOptions,
 } from './attach.ts';
+
+// ============================================================================
+// OpenTelemetry Bridge
+// ============================================================================
+
+export {
+  DebuggerOTelBridge,
+  getDebuggerOTelBridge,
+  createDebuggerOTelBridge,
+  attachOTelBridge,
+} from './otel_bridge.ts';
+
+export type {
+  DebuggerOTelBridgeOptions,
+} from './otel_bridge.ts';

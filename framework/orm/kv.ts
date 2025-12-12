@@ -4,6 +4,8 @@
  * Provides a high-level interface for Deno KV operations.
  */
 
+import { withDbSpan, isOTELEnabled } from '../telemetry/otel.ts';
+
 export interface KVStoreOptions {
   path?: string;
 }
@@ -40,30 +42,73 @@ export class KVStore {
    * Get a value by key
    */
   async get<T>(key: Deno.KvKey): Promise<T | null> {
-    const result = await this.kv.get<T>(key);
-    return result.value;
+    if (!isOTELEnabled()) {
+      const result = await this.kv.get<T>(key);
+      return result.value;
+    }
+
+    return await withDbSpan('kv.get', key, async (span) => {
+      span?.setAttribute('db.system', 'deno_kv');
+      span?.setAttribute('db.operation', 'get');
+      span?.setAttribute('db.key', JSON.stringify(key));
+      const result = await this.kv.get<T>(key);
+      return result.value;
+    });
   }
 
   /**
    * Get multiple values by keys
    */
   async getMany<T>(keys: Deno.KvKey[]): Promise<(T | null)[]> {
-    const results = await this.kv.getMany<T[]>(keys);
-    return results.map((r) => r.value);
+    if (!isOTELEnabled()) {
+      const results = await this.kv.getMany<T[]>(keys);
+      return results.map((r) => r.value);
+    }
+
+    return await withDbSpan('kv.getMany', keys[0] || [], async (span) => {
+      span?.setAttribute('db.system', 'deno_kv');
+      span?.setAttribute('db.operation', 'getMany');
+      span?.setAttribute('db.batch.size', keys.length);
+      const results = await this.kv.getMany<T[]>(keys);
+      return results.map((r) => r.value);
+    });
   }
 
   /**
    * Set a value
    */
   async set<T>(key: Deno.KvKey, value: T, options?: { expireIn?: number }): Promise<void> {
-    await this.kv.set(key, value, options);
+    if (!isOTELEnabled()) {
+      await this.kv.set(key, value, options);
+      return;
+    }
+
+    await withDbSpan('kv.set', key, async (span) => {
+      span?.setAttribute('db.system', 'deno_kv');
+      span?.setAttribute('db.operation', 'set');
+      span?.setAttribute('db.key', JSON.stringify(key));
+      if (options?.expireIn) {
+        span?.setAttribute('db.kv.ttl', options.expireIn);
+      }
+      await this.kv.set(key, value, options);
+    });
   }
 
   /**
    * Delete a value
    */
   async delete(key: Deno.KvKey): Promise<void> {
-    await this.kv.delete(key);
+    if (!isOTELEnabled()) {
+      await this.kv.delete(key);
+      return;
+    }
+
+    await withDbSpan('kv.delete', key, async (span) => {
+      span?.setAttribute('db.system', 'deno_kv');
+      span?.setAttribute('db.operation', 'delete');
+      span?.setAttribute('db.key', JSON.stringify(key));
+      await this.kv.delete(key);
+    });
   }
 
   /**
@@ -73,14 +118,35 @@ export class KVStore {
     prefix: Deno.KvKey,
     options?: Deno.KvListOptions
   ): Promise<{ key: Deno.KvKey; value: T }[]> {
-    const results: { key: Deno.KvKey; value: T }[] = [];
-    const entries = this.kv.list<T>({ prefix }, options);
+    if (!isOTELEnabled()) {
+      const results: { key: Deno.KvKey; value: T }[] = [];
+      const entries = this.kv.list<T>({ prefix }, options);
 
-    for await (const entry of entries) {
-      results.push({ key: entry.key, value: entry.value });
+      for await (const entry of entries) {
+        results.push({ key: entry.key, value: entry.value });
+      }
+
+      return results;
     }
 
-    return results;
+    return await withDbSpan('kv.list', prefix, async (span) => {
+      span?.setAttribute('db.system', 'deno_kv');
+      span?.setAttribute('db.operation', 'list');
+      span?.setAttribute('db.prefix', JSON.stringify(prefix));
+      if (options?.limit) {
+        span?.setAttribute('db.kv.limit', options.limit);
+      }
+
+      const results: { key: Deno.KvKey; value: T }[] = [];
+      const entries = this.kv.list<T>({ prefix }, options);
+
+      for await (const entry of entries) {
+        results.push({ key: entry.key, value: entry.value });
+      }
+
+      span?.setAttribute('db.result.count', results.length);
+      return results;
+    });
   }
 
   /**
@@ -104,7 +170,19 @@ export class KVStore {
     value: unknown,
     options?: { delay?: number; keysIfUndelivered?: Deno.KvKey[] }
   ): Promise<void> {
-    await this.kv.enqueue(value, options);
+    if (!isOTELEnabled()) {
+      await this.kv.enqueue(value, options);
+      return;
+    }
+
+    await withDbSpan('kv.enqueue', ['queue'], async (span) => {
+      span?.setAttribute('db.system', 'deno_kv');
+      span?.setAttribute('db.operation', 'enqueue');
+      if (options?.delay) {
+        span?.setAttribute('db.kv.delay_ms', options.delay);
+      }
+      await this.kv.enqueue(value, options);
+    });
   }
 
   /**

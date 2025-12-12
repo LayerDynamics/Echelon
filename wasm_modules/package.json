@@ -1,0 +1,13 @@
+{
+  "name": "echelon-wasm-modules",
+  "version": "1.0.0",
+  "description": "WebAssembly modules for Echelon framework",
+  "scripts": {
+    "build": "npm run build:asc",
+    "build:asc": "asc fibonacci.ts --outFile fibonacci.wasm --optimize --runtime stub",
+    "build:asc:debug": "asc fibonacci.ts --outFile fibonacci.debug.wasm --debug --runtime stub"
+  },
+  "devDependencies": {
+    "assemblyscript": "^0.27.0"
+  }
+}

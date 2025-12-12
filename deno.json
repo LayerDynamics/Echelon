@@ -5,7 +5,9 @@
 
   "tasks": {
     "dev": "deno run --watch -A main.ts",
+    "dev:otel": "OTEL_DENO=true OTEL_SERVICE_NAME=echelon deno run --watch -A main.ts",
     "start": "deno run --allow-net --allow-read --allow-env main.ts",
+    "start:otel": "OTEL_DENO=true OTEL_SERVICE_NAME=echelon deno run --allow-net --allow-read --allow-env main.ts",
     "test": "deno test --allow-all",
     "check": "deno check main.ts",
     "lint": "deno lint",
@@ -15,7 +17,9 @@
   "imports": {
     "@/": "./src/",
     "@echelon/": "./framework/",
-    "std/": "https://deno.land/std@0.220.0/"
+    "@wasm/": "./wasm_modules/",
+    "std/": "https://deno.land/std@0.220.0/",
+    "@opentelemetry/api": "npm:@opentelemetry/api@1"
   },
 
   "compilerOptions": {

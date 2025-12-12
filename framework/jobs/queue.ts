@@ -5,6 +5,7 @@
  */
 
 import { getKV } from '../orm/kv.ts';
+import { withSpan, isOTELEnabled, SpanKind, SpanStatusCode } from '../telemetry/otel.ts';
 
 export interface Job<T = unknown> {
   id: string;
@@ -55,30 +56,71 @@ export class JobQueue {
    * Enqueue a job
    */
   async enqueue<T>(name: string, data: T, options: JobOptions = {}): Promise<string> {
-    const opts = { ...DEFAULT_OPTIONS, ...options };
+    if (!isOTELEnabled()) {
+      const opts = { ...DEFAULT_OPTIONS, ...options };
 
-    const job: Job<T> = {
-      id: crypto.randomUUID(),
-      name,
-      data,
-      attempts: 0,
-      maxAttempts: opts.maxAttempts!,
-      createdAt: new Date(),
-      scheduledAt: opts.delay ? new Date(Date.now() + opts.delay) : undefined,
-    };
+      const job: Job<T> = {
+        id: crypto.randomUUID(),
+        name,
+        data,
+        attempts: 0,
+        maxAttempts: opts.maxAttempts!,
+        createdAt: new Date(),
+        scheduledAt: opts.delay ? new Date(Date.now() + opts.delay) : undefined,
+      };
 
-    const kv = await getKV();
+      const kv = await getKV();
 
-    // Store job metadata
-    await kv.set([this.prefix, 'jobs', job.id], job);
+      // Store job metadata
+      await kv.set([this.prefix, 'jobs', job.id], job);
 
-    // Enqueue for processing
-    await kv.enqueue(
-      { jobId: job.id, name, priority: opts.priority },
-      { delay: opts.delay, keysIfUndelivered: [[this.prefix, 'failed', job.id]] }
-    );
+      // Enqueue for processing
+      await kv.enqueue(
+        { jobId: job.id, name, priority: opts.priority },
+        { delay: opts.delay, keysIfUndelivered: [[this.prefix, 'failed', job.id]] }
+      );
 
-    return job.id;
+      return job.id;
+    }
+
+    return await withSpan('job.enqueue', async (span) => {
+      span?.setAttribute('job.name', name);
+      span?.setAttribute('job.queue', this.prefix);
+
+      const opts = { ...DEFAULT_OPTIONS, ...options };
+
+      const job: Job<T> = {
+        id: crypto.randomUUID(),
+        name,
+        data,
+        attempts: 0,
+        maxAttempts: opts.maxAttempts!,
+        createdAt: new Date(),
+        scheduledAt: opts.delay ? new Date(Date.now() + opts.delay) : undefined,
+      };
+
+      span?.setAttribute('job.id', job.id);
+      span?.setAttribute('job.max_attempts', job.maxAttempts);
+      if (opts.delay) {
+        span?.setAttribute('job.delay_ms', opts.delay);
+      }
+      if (opts.priority !== undefined) {
+        span?.setAttribute('job.priority', opts.priority);
+      }
+
+      const kv = await getKV();
+
+      // Store job metadata
+      await kv.set([this.prefix, 'jobs', job.id], job);
+
+      // Enqueue for processing
+      await kv.enqueue(
+        { jobId: job.id, name, priority: opts.priority },
+        { delay: opts.delay, keysIfUndelivered: [[this.prefix, 'failed', job.id]] }
+      );
+
+      return job.id;
+    }, { kind: SpanKind.PRODUCER });
   }
 
   /**
@@ -124,38 +166,97 @@ export class JobQueue {
         return;
       }
 
-      try {
-        // Increment attempts
-        job.attempts++;
-        await kv.set([this.prefix, 'jobs', job.id], job);
+      if (!isOTELEnabled()) {
+        try {
+          // Increment attempts
+          job.attempts++;
+          await kv.set([this.prefix, 'jobs', job.id], job);
 
-        // Execute handler
-        await handler(job);
+          // Execute handler
+          await handler(job);
 
-        // Mark as completed
-        await kv.delete([this.prefix, 'jobs', job.id]);
-        console.log(`Job completed: ${job.id} (${name})`);
-      } catch (error) {
-        console.error(`Job failed: ${job.id} (${name})`, error);
-
-        job.error = (error as Error).message;
-        job.failedAt = new Date();
-
-        if (job.attempts < job.maxAttempts) {
-          // Retry with exponential backoff
-          const delay = Math.pow(2, job.attempts) * 1000;
-          await kv.enqueue(
-            { jobId: job.id, name },
-            { delay, keysIfUndelivered: [[this.prefix, 'failed', job.id]] }
-          );
-          console.log(`Job retry scheduled: ${job.id} in ${delay}ms`);
-        } else {
-          // Move to failed jobs
-          await kv.set([this.prefix, 'failed', job.id], job);
+          // Mark as completed
           await kv.delete([this.prefix, 'jobs', job.id]);
-          console.log(`Job permanently failed: ${job.id}`);
+          console.log(`Job completed: ${job.id} (${name})`);
+        } catch (error) {
+          console.error(`Job failed: ${job.id} (${name})`, error);
+
+          job.error = (error as Error).message;
+          job.failedAt = new Date();
+
+          if (job.attempts < job.maxAttempts) {
+            // Retry with exponential backoff
+            const delay = Math.pow(2, job.attempts) * 1000;
+            await kv.enqueue(
+              { jobId: job.id, name },
+              { delay, keysIfUndelivered: [[this.prefix, 'failed', job.id]] }
+            );
+            console.log(`Job retry scheduled: ${job.id} in ${delay}ms`);
+          } else {
+            // Move to failed jobs
+            await kv.set([this.prefix, 'failed', job.id], job);
+            await kv.delete([this.prefix, 'jobs', job.id]);
+            console.log(`Job permanently failed: ${job.id}`);
+          }
         }
+        return;
       }
+
+      // With OTEL instrumentation
+      await withSpan(`job.process.${name}`, async (span) => {
+        span?.setAttribute('job.id', job.id);
+        span?.setAttribute('job.name', name);
+        span?.setAttribute('job.queue', this.prefix);
+        span?.setAttribute('job.attempt', job.attempts + 1);
+        span?.setAttribute('job.max_attempts', job.maxAttempts);
+
+        try {
+          // Increment attempts
+          job.attempts++;
+          await kv.set([this.prefix, 'jobs', job.id], job);
+
+          // Execute handler
+          await handler(job);
+
+          // Mark as completed
+          await kv.delete([this.prefix, 'jobs', job.id]);
+          console.log(`Job completed: ${job.id} (${name})`);
+
+          span?.setAttribute('job.status', 'completed');
+          span?.setStatus({ code: SpanStatusCode.OK });
+        } catch (error) {
+          console.error(`Job failed: ${job.id} (${name})`, error);
+
+          job.error = (error as Error).message;
+          job.failedAt = new Date();
+
+          span?.recordException(error as Error);
+          span?.setAttribute('job.status', 'failed');
+          span?.setAttribute('job.error', (error as Error).message);
+
+          if (job.attempts < job.maxAttempts) {
+            // Retry with exponential backoff
+            const delay = Math.pow(2, job.attempts) * 1000;
+            await kv.enqueue(
+              { jobId: job.id, name },
+              { delay, keysIfUndelivered: [[this.prefix, 'failed', job.id]] }
+            );
+            console.log(`Job retry scheduled: ${job.id} in ${delay}ms`);
+
+            span?.setAttribute('job.retry', true);
+            span?.setAttribute('job.retry_delay_ms', delay);
+            span?.setStatus({ code: SpanStatusCode.ERROR, message: 'Job failed, will retry' });
+          } else {
+            // Move to failed jobs
+            await kv.set([this.prefix, 'failed', job.id], job);
+            await kv.delete([this.prefix, 'jobs', job.id]);
+            console.log(`Job permanently failed: ${job.id}`);
+
+            span?.setAttribute('job.retry', false);
+            span?.setStatus({ code: SpanStatusCode.ERROR, message: 'Job permanently failed' });
+          }
+        }
+      }, { kind: SpanKind.CONSUMER });
     });
   }
 

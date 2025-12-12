@@ -12,6 +12,7 @@
 Echelon is an Application Operating System–style web framework built entirely on Deno. It treats the full stack—runtime, HTTP, middleware, routing, data, auth, security, telemetry, and WASM—like OS layers, emphasizing minimal dependencies, type safety, and secure defaults inspired by Deno's permission model. “Batteries included” means you get routing, middleware, KV-backed ORM, RBAC-aware auth, caching, job scheduling, telemetry, plugins, and WASM execution without adding third-party packages.
 
 ## Table of Contents
+
 - [Overview](#overview)
 - [Quick Start](#quick-start)
 - [Routes & Live Checks](#routes--live-checks)
@@ -22,23 +23,30 @@ Echelon is an Application Operating System–style web framework built entirely 
 - [Development Tasks](#development-tasks)
 
 ## Overview
+
 - **Application OS mindset:** Echelon abstracts the web stack the way an operating system abstracts hardware, layering runtime, routing, data, auth, and telemetry into cohesive modules with RBAC and admin capabilities as first-class citizens.【F:docs/planning/RuntimeLayer.md†L9-L45】
 - **Secure, Deno-native foundation:** The boot sequence uses Deno's configuration loader, permission checks, and KV store before wiring routes and starting the server, keeping permissions explicit and minimal.【F:main.ts†L14-L38】
 - **Observable by default:** Built-in telemetry surfaces metrics in Prometheus format and ships a debugger hook for lifecycle insights.【F:src/routes/api.ts†L45-L50】
 
 ## Quick Start
+
 1. **Install Deno** from [deno.land](https://deno.land/#installation).
 2. **Run in watch mode** during development:
+
    ```sh
    deno task dev
    ```
+
 3. **Run with minimal permissions** for local usage:
+
    ```sh
    deno task start
    ```
+
 4. The server logs the startup URL and listens on `http://localhost:8000` by default (configurable via `port`).【F:main.ts†L32-L38】
 
 ## Routes & Live Checks
+
 - `GET /` – Gradient-themed landing page linking to API checks.【F:src/routes/home.ts†L14-L86】
 - `GET /about` – Overview of Echelon and its feature pillars.【F:src/routes/home.ts†L89-L142】
 - `GET /api/health` – Health snapshot with uptime seconds.【F:src/routes/api.ts†L11-L23】
@@ -48,11 +56,13 @@ Echelon is an Application Operating System–style web framework built entirely 
 - `POST /api/echo` – JSON echo with validation and error handling.【F:src/routes/api.ts†L66-L85】
 
 ## Architecture at a Glance
+
 - **Boot flow:** load configuration → check permissions → open Deno KV → create `Application` → initialize plugins/telemetry → register routes → start the HTTP server.【F:main.ts†L14-L38】
 - **Routing:** routes are composed through a shared `Router` and registered via `registerRoutes`, providing default 404/error handlers you can override.【F:src/routes/mod.ts†L11-L29】
 - **Data layer:** example `User` model demonstrates Deno KV persistence, validation, indexed queries, and safe serialization that omits passwords.【F:src/models/user.ts†L1-L102】
 
 ## Features
+
 - **Deno-first:** Zero/low external dependencies, leveraging standard Web APIs, KV, and permissions.【F:docs/planning/RuntimeLayer.md†L9-L74】
 - **TypeScript everywhere:** Strict compiler settings with JSX support for future view layers.【F:deno.json†L21-L26】
 - **Secure by design:** Permission checks are part of the startup contract; harden further by extending `checkPermissions` requirements.【F:main.ts†L17-L38】
@@ -60,6 +70,7 @@ Echelon is an Application Operating System–style web framework built entirely 
 - **WASM-ready & pluggable:** Framework layers include WASM runtime hooks and plugin scaffolding to extend the Application OS model.【F:docs/planning/RuntimeLayer.md†L27-L74】
 
 ## Application OS Design
+
 Echelon is structured like an operating system for web apps, with layers that cooperate but stay decoupled so features can be enabled, replaced, or composed as needed.【F:docs/planning/RuntimeLayer.md†L9-L107】 Here’s how the batteries snap together:
 
 - **Runtime core (Layer 0):** Manages lifecycle and permission checks while initializing Deno KV and the WASM runtime when enabled.【F:main.ts†L14-L38】【F:docs/planning/RuntimeLayer.md†L9-L26】
@@ -73,6 +84,7 @@ Echelon is structured like an operating system for web apps, with layers that co
 **Batteries included:** If you scaffold a feature, the stack is already there—routes, middleware, metrics, and debugging are wired together; the KV ORM handles validation; security and RBAC hooks guard every layer; and WASM execution is ready without additional tooling.
 
 ## Project Layout
+
 - `main.ts` – Entry point coordinating configuration, permission checks, KV open, route registration, and server startup.【F:main.ts†L14-L38】
 - `src/routes/` – Home and API routers plus registration helpers (404/error defaults included).【F:src/routes/mod.ts†L11-L29】【F:src/routes/home.ts†L14-L142】【F:src/routes/api.ts†L11-L85】
 - `src/models/` – Example Deno KV models such as `User` with validation and indexing helpers.【F:src/models/user.ts†L1-L102】
@@ -80,7 +92,9 @@ Echelon is structured like an operating system for web apps, with layers that co
 - `docs/planning/` – Architecture blueprints outlining the layered runtime and Application OS philosophy.【F:docs/planning/RuntimeLayer.md†L9-L107】
 
 ## Development Tasks
+
 Use the built-in Deno tasks for a consistent workflow:
+
 - `deno task dev` – Run in watch mode with all permissions for rapid iteration.【F:deno.json†L6-L8】
 - `deno task start` – Start with only net/read/env permissions.【F:deno.json†L6-L9】
 - `deno task test` – Run the test suite (full permissions).【F:deno.json†L6-L10】

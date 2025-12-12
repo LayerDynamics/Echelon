@@ -101,6 +101,14 @@ export interface WASMInstantiationOptions {
   table?: WebAssembly.Table;
   sandboxId?: string;
   timeout?: number;
+  enableWASI?: boolean;
+  wasiOptions?: {
+    args?: string[];
+    env?: Record<string, string>;
+    preopenedDirectories?: Map<string, string>;
+    allowRead?: boolean;
+    allowWrite?: boolean;
+  };
 }
 
 // ============================================================================

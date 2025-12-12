@@ -1,0 +1,12 @@
+# WASM Modules Directory
+#
+# Place your .wasm files here to use with Deno 2.1+ native imports.
+#
+# Usage with import map (@wasm/ alias):
+#   import { add } from "@wasm/math.wasm";
+#
+# Usage with native registry:
+#   await runtime.registerNativeModule('math', '@wasm/math.wasm');
+#   const result = runtime.callNative<number>('math', 'add', 1, 2);
+#
+# See: https://docs.deno.com/runtime/reference/wasm/

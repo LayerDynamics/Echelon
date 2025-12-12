@@ -8,6 +8,8 @@
 import { Application, type ApplicationOptions } from '@echelon/app.ts';
 import { loadConfig, type ConfigOptions } from '@echelon/config/mod.ts';
 import { checkPermissions } from '@echelon/runtime/permissions.ts';
+import { createSessionMiddleware } from '@echelon/auth/session.ts';
+import { createAuthMiddleware } from '@echelon/auth/auth.ts';
 
 // Boot sequence as defined in Layer 0
 async function main(): Promise<void> {
@@ -20,20 +22,37 @@ async function main(): Promise<void> {
   // 3. Open database (Deno KV)
   const _kv = await Deno.openKv();
 
-  // 4. Create application instance
+  // 4. Seed database with default data (admin user)
+  const { seedDatabase } = await import('@/contexts/iam/infrastructure/seed.ts');
+  await seedDatabase();
+
+  // 5. Create application instance
   const app = new Application({
     config: config.all() as ConfigOptions,
   });
 
-  // 5. Initialize application
+  // 6. Register global middleware
+  // Session middleware must run first to load sessions from cookies
+  app.use(createSessionMiddleware({
+    secure: false, // Set to true in production with HTTPS
+  }));
+
+  // Auth middleware loads user from session into context
+  const { getAuthService } = await import('@/contexts/iam/application/auth_service.ts');
+  const authService = await getAuthService();
+  app.use(createAuthMiddleware({
+    userLoader: (id) => authService.loadUser(id),
+  }));
+
+  // 7. Initialize application
   await app.init();
 
-  // 6. Register routes (from src/)
+  // 8. Register routes (from src/)
   const { registerRoutes } = await import('@/routes/mod.ts');
-  registerRoutes(app);
+  await registerRoutes(app);
 
-  // 7. Start server
-  const port = config.get<number>('port', 8000);
+  // 9. Start server
+  const port = config.get<number>('port', 9090);
   console.log(`🚀 Echelon starting on http://localhost:${port}`);
   await app.listen({ port });
 }

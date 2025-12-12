@@ -1,0 +1,20 @@
+{
+  "targets": {
+    "release": {
+      "outFile": "fibonacci.wasm",
+      "sourceMap": false,
+      "optimizeLevel": 3,
+      "shrinkLevel": 0,
+      "runtime": "stub"
+    },
+    "debug": {
+      "outFile": "fibonacci.debug.wasm",
+      "sourceMap": true,
+      "debug": true,
+      "runtime": "stub"
+    }
+  },
+  "options": {
+    "bindings": "esm"
+  }
+}

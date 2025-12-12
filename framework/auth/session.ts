@@ -174,6 +174,41 @@ export class Session {
   }
 
   /**
+   * Convert session to Set-Cookie header value
+   */
+  toCookie(): string {
+    const parts = [
+      `${this.options.name}=${this.id}`
+    ];
+
+    if (this.options.maxAge) {
+      parts.push(`Max-Age=${this.options.maxAge}`);
+    }
+
+    if (this.options.path) {
+      parts.push(`Path=${this.options.path}`);
+    }
+
+    if (this.options.domain) {
+      parts.push(`Domain=${this.options.domain}`);
+    }
+
+    if (this.options.secure) {
+      parts.push('Secure');
+    }
+
+    if (this.options.httpOnly) {
+      parts.push('HttpOnly');
+    }
+
+    if (this.options.sameSite) {
+      parts.push(`SameSite=${this.options.sameSite}`);
+    }
+
+    return parts.join('; ');
+  }
+
+  /**
    * Flash data - available only for the next request
    */
   flash(key: string, value?: unknown): unknown {
@@ -232,6 +267,74 @@ export function sessionMiddleware(options: SessionOptions = {}) {
         sameSite: opts.sameSite,
         path: opts.path,
         domain: opts.domain,
+      });
+    }
+
+    return response;
+  };
+}
+
+/**
+ * Context-based session middleware for Application
+ * This is the middleware used by app.use()
+ */
+export function createSessionMiddleware(options: SessionOptions = {}) {
+  const opts = { ...DEFAULT_OPTIONS, ...options };
+
+  type MiddlewareContext = {
+    request: Request;
+    url: URL;
+    params: Record<string, string>;
+    query: URLSearchParams;
+    state: Map<string, unknown>;
+    header(name: string): string | null;
+    method: string;
+  };
+
+  return async (
+    ctx: MiddlewareContext,
+    next: () => Promise<Response>
+  ): Promise<Response> => {
+    // Parse cookies from request
+    const cookieHeader = ctx.request.headers.get('Cookie') ?? '';
+    const cookies = new Map<string, string>();
+    for (const cookie of cookieHeader.split(';')) {
+      const [name, ...rest] = cookie.split('=');
+      if (name) {
+        cookies.set(name.trim(), rest.join('=').trim());
+      }
+    }
+
+    // Get session ID from cookie
+    const sessionId = cookies.get(opts.name!);
+    const hadCookie = sessionId !== undefined;
+
+    // Create session instance
+    const session = new Session(sessionId ?? null, opts);
+
+    // Load existing session data
+    if (sessionId) {
+      await session.load();
+    }
+
+    // Attach session to context state
+    ctx.state.set('session', session);
+
+    // Continue with request
+    const response = await next();
+
+    // Save session after request
+    await session.save();
+
+    // Set session cookie if we didn't have one before
+    if (!hadCookie) {
+      const headers = new Headers(response.headers);
+      headers.append('Set-Cookie', session.toCookie());
+
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
       });
     }
 

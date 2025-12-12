@@ -69,6 +69,20 @@ export interface WASMRuntimeConfig {
    * @default false
    */
   enableNativeImports?: boolean;
+
+  /**
+   * Enable WASI (WebAssembly System Interface) support.
+   * Provides filesystem, environment, clock, and random capabilities.
+   * @default true
+   */
+  enableWASI?: boolean;
+
+  /**
+   * Enable host function registry with automatic context injection.
+   * Provides standard library functions with proper memory access.
+   * @default true
+   */
+  enableHostFunctionRegistry?: boolean;
 }
 
 /**
@@ -89,6 +103,9 @@ export class WASMRuntimeCore {
   private sandboxManager: WASMSandboxManager;
   private events: EventEmitter;
   private lifecycle: Lifecycle;
+
+  // Native WASM registry (Deno 2.1+ feature)
+  private nativeRegistry: NativeWASMRegistry | null = null;
 
   // Module management
   private loadedModules: Map<string, WASMModule> = new Map();
@@ -121,7 +138,7 @@ export class WASMRuntimeCore {
     this.events = events;
     this.lifecycle = lifecycle;
 
-    // Set default configuration
+    // Set default configuration (including Deno 2.1+ features)
     this.config = {
       globalMemoryLimit: config.globalMemoryLimit ?? 256 * 1024 * 1024,
       defaultModuleMemoryLimit: config.defaultModuleMemoryLimit ?? 16 * 1024 * 1024,
@@ -131,15 +148,36 @@ export class WASMRuntimeCore {
       defaultSandboxConfig: config.defaultSandboxConfig ?? {},
       enableSandboxing: config.enableSandboxing ?? true,
       enableMetrics: config.enableMetrics ?? true,
+      // Deno 2.1+ defaults
+      preferStreamingCompilation: config.preferStreamingCompilation ?? true,
+      enableNativeImports: config.enableNativeImports ?? false,
+      // WASI and host function registry
+      enableWASI: config.enableWASI ?? true,
+      enableHostFunctionRegistry: config.enableHostFunctionRegistry ?? true,
     };
 
     this.metricsEnabled = this.config.enableMetrics;
 
+    // Merge streaming preference into loader options
+    const loaderOptions: WASMLoaderOptions = {
+      ...this.config.loaderOptions,
+      preferStreaming: this.config.preferStreamingCompilation,
+    };
+
     // Initialize sub-components
     this.memoryManager = new WASMMemoryManager(events, this.config.globalMemoryLimit);
-    this.loader = new WASMModuleLoader(events, this.config.loaderOptions);
-    this.executor = new WASMExecutor(events, this.memoryManager);
+    this.loader = new WASMModuleLoader(events, loaderOptions);
+    this.executor = new WASMExecutor(events, this.memoryManager, {
+      enableWASI: this.config.enableWASI,
+      enableHostFunctionRegistry: this.config.enableHostFunctionRegistry,
+    });
     this.sandboxManager = new WASMSandboxManager(events, this.memoryManager);
+
+    // Initialize native registry if enabled (Deno 2.1+ feature)
+    if (this.config.enableNativeImports) {
+      this.nativeRegistry = new NativeWASMRegistry({ events, debug: false });
+      logger.debug('Native WASM imports enabled');
+    }
 
     // Register lifecycle hooks
     this.registerLifecycleHooks();
@@ -580,6 +618,78 @@ export class WASMRuntimeCore {
    */
   getExecutor(): WASMExecutor {
     return this.executor;
+  }
+
+  // ============================================================================
+  // Native WASM Import Support (Deno 2.1+)
+  // ============================================================================
+
+  /**
+   * Get the native WASM registry (Deno 2.1+ feature).
+   * Returns null if enableNativeImports is false.
+   */
+  getNativeRegistry(): NativeWASMRegistry | null {
+    return this.nativeRegistry;
+  }
+
+  /**
+   * Check if native imports are enabled
+   */
+  isNativeImportsEnabled(): boolean {
+    return this.nativeRegistry !== null;
+  }
+
+  /**
+   * Register a native WASM module (Deno 2.1+ feature).
+   *
+   * Uses Deno's native import system to load the module.
+   * Requires enableNativeImports: true in config.
+   *
+   * @example
+   * ```typescript
+   * // In deno.json: { "imports": { "@wasm/math": "./math.wasm" } }
+   * await runtime.registerNativeModule('math', '@wasm/math');
+   * const result = runtime.callNative<number>('math', 'add', 1, 2);
+   * ```
+   */
+  async registerNativeModule(alias: string, specifier: string): Promise<void> {
+    if (!this.nativeRegistry) {
+      throw new Error(
+        'Native WASM imports are not enabled. Set enableNativeImports: true in config.'
+      );
+    }
+    await this.nativeRegistry.register(alias, specifier);
+  }
+
+  /**
+   * Call a function from a native WASM module (Deno 2.1+ feature).
+   *
+   * @example
+   * ```typescript
+   * const sum = runtime.callNative<number>('math', 'add', 5, 3);
+   * ```
+   */
+  callNative<T = unknown>(alias: string, funcName: string, ...args: unknown[]): T {
+    if (!this.nativeRegistry) {
+      throw new Error(
+        'Native WASM imports are not enabled. Set enableNativeImports: true in config.'
+      );
+    }
+    return this.nativeRegistry.call<T>(alias, funcName, ...args);
+  }
+
+  /**
+   * Get exports from a native WASM module (Deno 2.1+ feature).
+   */
+  getNativeExports(alias: string): Record<string, unknown> | undefined {
+    return this.nativeRegistry?.getExports(alias);
+  }
+
+  /**
+   * Unregister a native WASM module (Deno 2.1+ feature).
+   */
+  unregisterNativeModule(alias: string): boolean {
+    return this.nativeRegistry?.unregister(alias) ?? false;
   }
 
   // ============================================================================

@@ -2,7 +2,10 @@
  * Structured Logging
  *
  * JSON-structured logging with levels and context.
+ * Includes OpenTelemetry trace context correlation when OTEL is enabled.
  */
+
+import { isOTELEnabled, getActiveSpan } from './otel.ts';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -16,6 +19,10 @@ export interface LogEntry {
     message: string;
     stack?: string;
   };
+  /** OpenTelemetry trace ID for correlation (when OTEL is enabled) */
+  traceId?: string;
+  /** OpenTelemetry span ID for correlation (when OTEL is enabled) */
+  spanId?: string;
 }
 
 export interface LoggerOptions {
@@ -120,6 +127,16 @@ export class Logger {
       context: { ...this.context, ...context },
     };
 
+    // Add OpenTelemetry trace context for correlation
+    if (isOTELEnabled()) {
+      const span = getActiveSpan();
+      if (span) {
+        const spanContext = span.spanContext();
+        entry.traceId = spanContext.traceId;
+        entry.spanId = spanContext.spanId;
+      }
+    }
+
     if (error) {
       entry.error = {
         name: error.name,
@@ -154,11 +171,19 @@ export class Logger {
     };
     const reset = '\x1b[0m';
     const dim = '\x1b[2m';
+    const magenta = '\x1b[35m';
 
     const timestamp = dim + entry.timestamp + reset;
     const level = colors[entry.level] + entry.level.toUpperCase().padEnd(5) + reset;
 
     let output = `${timestamp} ${level} ${entry.message}`;
+
+    // Show trace context if present
+    if (entry.traceId) {
+      const traceShort = entry.traceId.slice(0, 8);
+      const spanShort = entry.spanId?.slice(0, 8) ?? '';
+      output += ` ${magenta}[trace:${traceShort}:${spanShort}]${reset}`;
+    }
 
     if (entry.context && Object.keys(entry.context).length > 0) {
       output += ` ${dim}${JSON.stringify(entry.context)}${reset}`;

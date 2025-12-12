@@ -8,6 +8,7 @@
 
 import { getKV } from '../orm/kv.ts';
 import { getDebugger, DebugLevel, DebugModule } from '../debugger/mod.ts';
+import { withSpan, isOTELEnabled, SpanKind } from '../telemetry/otel.ts';
 
 export interface CacheEntry<T> {
   value: T;
@@ -61,58 +62,131 @@ export class Cache {
       data: { key },
     });
 
-    // Check memory cache first
-    const memoryEntry = this.memoryCache.get(key);
-    if (memoryEntry) {
-      if (memoryEntry.expiresAt === null || memoryEntry.expiresAt > Date.now()) {
-        debugger_.emit('cache:hit', DebugModule.CACHE, DebugLevel.DEBUG, `Cache hit (memory): ${key}`, {
+    if (!isOTELEnabled()) {
+      // Check memory cache first
+      const memoryEntry = this.memoryCache.get(key);
+      if (memoryEntry) {
+        if (memoryEntry.expiresAt === null || memoryEntry.expiresAt > Date.now()) {
+          debugger_.emit('cache:hit', DebugModule.CACHE, DebugLevel.DEBUG, `Cache hit (memory): ${key}`, {
+            data: { key, source: 'memory' },
+          });
+          return memoryEntry.value as T;
+        }
+        this.memoryCache.delete(key);
+        debugger_.emit('cache:miss', DebugModule.CACHE, DebugLevel.DEBUG, `Cache expired: ${key}`, {
+          data: { key, reason: 'expired' },
+        });
+        return undefined;
+      }
+
+      // If memory-only mode, don't check KV
+      if (this.isMemoryOnly()) {
+        debugger_.emit('cache:miss', DebugModule.CACHE, DebugLevel.DEBUG, `Cache miss: ${key}`, {
           data: { key, source: 'memory' },
         });
-        return memoryEntry.value as T;
+        return undefined;
       }
-      this.memoryCache.delete(key);
-      debugger_.emit('cache:miss', DebugModule.CACHE, DebugLevel.DEBUG, `Cache expired: ${key}`, {
-        data: { key, reason: 'expired' },
-      });
-      return undefined;
-    }
 
-    // If memory-only mode, don't check KV
-    if (this.isMemoryOnly()) {
-      debugger_.emit('cache:miss', DebugModule.CACHE, DebugLevel.DEBUG, `Cache miss: ${key}`, {
-        data: { key, source: 'memory' },
-      });
-      return undefined;
-    }
+      // Check KV store
+      const kv = await getKV();
+      const entry = await kv.get<CacheEntry<T>>([this.options.prefix!, key]);
 
-    // Check KV store
-    const kv = await getKV();
-    const entry = await kv.get<CacheEntry<T>>([this.options.prefix!, key]);
+      if (!entry) {
+        debugger_.emit('cache:miss', DebugModule.CACHE, DebugLevel.DEBUG, `Cache miss: ${key}`, {
+          data: { key, source: 'kv' },
+        });
+        return undefined;
+      }
 
-    if (!entry) {
-      debugger_.emit('cache:miss', DebugModule.CACHE, DebugLevel.DEBUG, `Cache miss: ${key}`, {
+      // Check expiration
+      if (entry.expiresAt !== null && entry.expiresAt <= Date.now()) {
+        await this.delete(key);
+        debugger_.emit('cache:miss', DebugModule.CACHE, DebugLevel.DEBUG, `Cache expired (kv): ${key}`, {
+          data: { key, reason: 'expired' },
+        });
+        return undefined;
+      }
+
+      // Cache in memory
+      this.memoryCache.set(key, entry);
+
+      debugger_.emit('cache:hit', DebugModule.CACHE, DebugLevel.DEBUG, `Cache hit (kv): ${key}`, {
         data: { key, source: 'kv' },
       });
-      return undefined;
+
+      return entry.value;
     }
 
-    // Check expiration
-    if (entry.expiresAt !== null && entry.expiresAt <= Date.now()) {
-      await this.delete(key);
-      debugger_.emit('cache:miss', DebugModule.CACHE, DebugLevel.DEBUG, `Cache expired (kv): ${key}`, {
-        data: { key, reason: 'expired' },
+    return await withSpan('cache.get', async (span) => {
+      span?.setAttribute('cache.key', key);
+      span?.setAttribute('cache.prefix', this.options.prefix!);
+
+      // Check memory cache first
+      const memoryEntry = this.memoryCache.get(key);
+      if (memoryEntry) {
+        if (memoryEntry.expiresAt === null || memoryEntry.expiresAt > Date.now()) {
+          debugger_.emit('cache:hit', DebugModule.CACHE, DebugLevel.DEBUG, `Cache hit (memory): ${key}`, {
+            data: { key, source: 'memory' },
+          });
+          span?.setAttribute('cache.hit', true);
+          span?.setAttribute('cache.source', 'memory');
+          return memoryEntry.value as T;
+        }
+        this.memoryCache.delete(key);
+        debugger_.emit('cache:miss', DebugModule.CACHE, DebugLevel.DEBUG, `Cache expired: ${key}`, {
+          data: { key, reason: 'expired' },
+        });
+        span?.setAttribute('cache.hit', false);
+        span?.setAttribute('cache.miss_reason', 'expired');
+        return undefined;
+      }
+
+      // If memory-only mode, don't check KV
+      if (this.isMemoryOnly()) {
+        debugger_.emit('cache:miss', DebugModule.CACHE, DebugLevel.DEBUG, `Cache miss: ${key}`, {
+          data: { key, source: 'memory' },
+        });
+        span?.setAttribute('cache.hit', false);
+        span?.setAttribute('cache.source', 'memory');
+        return undefined;
+      }
+
+      // Check KV store
+      const kv = await getKV();
+      const entry = await kv.get<CacheEntry<T>>([this.options.prefix!, key]);
+
+      if (!entry) {
+        debugger_.emit('cache:miss', DebugModule.CACHE, DebugLevel.DEBUG, `Cache miss: ${key}`, {
+          data: { key, source: 'kv' },
+        });
+        span?.setAttribute('cache.hit', false);
+        span?.setAttribute('cache.source', 'kv');
+        return undefined;
+      }
+
+      // Check expiration
+      if (entry.expiresAt !== null && entry.expiresAt <= Date.now()) {
+        await this.delete(key);
+        debugger_.emit('cache:miss', DebugModule.CACHE, DebugLevel.DEBUG, `Cache expired (kv): ${key}`, {
+          data: { key, reason: 'expired' },
+        });
+        span?.setAttribute('cache.hit', false);
+        span?.setAttribute('cache.miss_reason', 'expired');
+        span?.setAttribute('cache.source', 'kv');
+        return undefined;
+      }
+
+      // Cache in memory
+      this.memoryCache.set(key, entry);
+
+      debugger_.emit('cache:hit', DebugModule.CACHE, DebugLevel.DEBUG, `Cache hit (kv): ${key}`, {
+        data: { key, source: 'kv' },
       });
-      return undefined;
-    }
 
-    // Cache in memory
-    this.memoryCache.set(key, entry);
-
-    debugger_.emit('cache:hit', DebugModule.CACHE, DebugLevel.DEBUG, `Cache hit (kv): ${key}`, {
-      data: { key, source: 'kv' },
-    });
-
-    return entry.value;
+      span?.setAttribute('cache.hit', true);
+      span?.setAttribute('cache.source', 'kv');
+      return entry.value;
+    }, { kind: SpanKind.INTERNAL });
   }
 
   /**
@@ -121,30 +195,67 @@ export class Cache {
   async set<T>(key: string, value: T, ttl?: number): Promise<void> {
     const debugger_ = getDebugger();
     const ttlMs = ttl ?? this.options.defaultTtl!;
-    const expiresAt = ttlMs > 0 ? Date.now() + ttlMs : null;
 
-    const entry: CacheEntry<T> = {
-      value,
-      expiresAt,
-      createdAt: Date.now(),
-    };
+    if (!isOTELEnabled()) {
+      const expiresAt = ttlMs > 0 ? Date.now() + ttlMs : null;
 
-    // Store in memory
-    this.memoryCache.set(key, entry);
+      const entry: CacheEntry<T> = {
+        value,
+        expiresAt,
+        createdAt: Date.now(),
+      };
 
-    debugger_.emit('cache:set', DebugModule.CACHE, DebugLevel.DEBUG, `Cache set: ${key}`, {
-      data: { key, ttl: ttlMs },
-    });
+      // Store in memory
+      this.memoryCache.set(key, entry);
 
-    // If memory-only mode, don't store in KV
-    if (this.isMemoryOnly()) {
+      debugger_.emit('cache:set', DebugModule.CACHE, DebugLevel.DEBUG, `Cache set: ${key}`, {
+        data: { key, ttl: ttlMs },
+      });
+
+      // If memory-only mode, don't store in KV
+      if (this.isMemoryOnly()) {
+        return;
+      }
+
+      // Store in KV
+      const kv = await getKV();
+      const expireIn = ttlMs > 0 ? ttlMs : undefined;
+      await kv.set([this.options.prefix!, key], entry, { expireIn });
       return;
     }
 
-    // Store in KV
-    const kv = await getKV();
-    const expireIn = ttlMs > 0 ? ttlMs : undefined;
-    await kv.set([this.options.prefix!, key], entry, { expireIn });
+    await withSpan('cache.set', async (span) => {
+      span?.setAttribute('cache.key', key);
+      span?.setAttribute('cache.prefix', this.options.prefix!);
+      span?.setAttribute('cache.ttl_ms', ttlMs);
+
+      const expiresAt = ttlMs > 0 ? Date.now() + ttlMs : null;
+
+      const entry: CacheEntry<T> = {
+        value,
+        expiresAt,
+        createdAt: Date.now(),
+      };
+
+      // Store in memory
+      this.memoryCache.set(key, entry);
+
+      debugger_.emit('cache:set', DebugModule.CACHE, DebugLevel.DEBUG, `Cache set: ${key}`, {
+        data: { key, ttl: ttlMs },
+      });
+
+      span?.setAttribute('cache.memory_only', this.isMemoryOnly());
+
+      // If memory-only mode, don't store in KV
+      if (this.isMemoryOnly()) {
+        return;
+      }
+
+      // Store in KV
+      const kv = await getKV();
+      const expireIn = ttlMs > 0 ? ttlMs : undefined;
+      await kv.set([this.options.prefix!, key], entry, { expireIn });
+    }, { kind: SpanKind.INTERNAL });
   }
 
   /**
@@ -169,15 +280,35 @@ export class Cache {
    * Delete a cached value
    */
   async delete(key: string): Promise<void> {
-    this.memoryCache.delete(key);
+    if (!isOTELEnabled()) {
+      this.memoryCache.delete(key);
 
-    // If memory-only mode, don't delete from KV
-    if (this.isMemoryOnly()) {
+      // If memory-only mode, don't delete from KV
+      if (this.isMemoryOnly()) {
+        return;
+      }
+
+      const kv = await getKV();
+      await kv.delete([this.options.prefix!, key]);
       return;
     }
 
-    const kv = await getKV();
-    await kv.delete([this.options.prefix!, key]);
+    await withSpan('cache.delete', async (span) => {
+      span?.setAttribute('cache.key', key);
+      span?.setAttribute('cache.prefix', this.options.prefix!);
+
+      this.memoryCache.delete(key);
+
+      // If memory-only mode, don't delete from KV
+      if (this.isMemoryOnly()) {
+        span?.setAttribute('cache.memory_only', true);
+        return;
+      }
+
+      span?.setAttribute('cache.memory_only', false);
+      const kv = await getKV();
+      await kv.delete([this.options.prefix!, key]);
+    }, { kind: SpanKind.INTERNAL });
   }
 
   /**
@@ -223,19 +354,48 @@ export class Cache {
    * Clear all cached values
    */
   async clear(): Promise<void> {
-    this.memoryCache.clear();
+    if (!isOTELEnabled()) {
+      this.memoryCache.clear();
 
-    // If memory-only mode, don't clear KV
-    if (this.isMemoryOnly()) {
+      // If memory-only mode, don't clear KV
+      if (this.isMemoryOnly()) {
+        return;
+      }
+
+      const kv = await getKV();
+      const entries = await kv.list([this.options.prefix!]);
+
+      for (const entry of entries) {
+        await kv.delete(entry.key);
+      }
       return;
     }
 
-    const kv = await getKV();
-    const entries = await kv.list([this.options.prefix!]);
+    await withSpan('cache.clear', async (span) => {
+      span?.setAttribute('cache.prefix', this.options.prefix!);
 
-    for (const entry of entries) {
-      await kv.delete(entry.key);
-    }
+      const memorySize = this.memoryCache.size;
+      this.memoryCache.clear();
+      span?.setAttribute('cache.memory_cleared', memorySize);
+
+      // If memory-only mode, don't clear KV
+      if (this.isMemoryOnly()) {
+        span?.setAttribute('cache.memory_only', true);
+        return;
+      }
+
+      span?.setAttribute('cache.memory_only', false);
+      const kv = await getKV();
+      const entries = await kv.list([this.options.prefix!]);
+
+      let kvCleared = 0;
+      for (const entry of entries) {
+        await kv.delete(entry.key);
+        kvCleared++;
+      }
+
+      span?.setAttribute('cache.kv_cleared', kvCleared);
+    }, { kind: SpanKind.INTERNAL });
   }
 
   /**

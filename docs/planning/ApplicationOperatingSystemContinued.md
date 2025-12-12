@@ -1,3 +1,10 @@
+# The Anatomy of an Application Operating System (Continued)
+
+A comprehensive technical reference defining the complete layered architecture of web application platforms (frameworks, CMS, and full-stack systems).
+
+> **Note:** This is a continuation of `ApplicationOperatingSystem.md`. This document describes the generic Application Operating System pattern. **Echelon** is an implementation of this pattern built on Deno. See `RuntimeLayer.md` for Echelon-specific architecture details.
+
+---
 
 ### 12.6 Development Tools
 

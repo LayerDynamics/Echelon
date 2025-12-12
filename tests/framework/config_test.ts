@@ -11,7 +11,7 @@ import { Config } from '../../framework/config/config.ts';
 
 Deno.test('Config - uses default values when no options provided', () => {
   const config = new Config();
-  assertEquals(config.get('port'), 8000);
+  assertEquals(config.get('port'), 9090);
   assertEquals(config.get('host'), '0.0.0.0');
   assertEquals(config.get('env'), 'development');
   assertEquals(config.get('debug'), false);

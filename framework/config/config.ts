@@ -27,7 +27,7 @@ export interface ConfigOptions {
 }
 
 const DEFAULT_CONFIG: ConfigOptions = {
-  port: 8000,
+  port: 9090,
   host: '0.0.0.0',
   env: 'development',
   debug: false,

@@ -7,6 +7,7 @@
 import type { EchelonRequest } from '../http/request.ts';
 import { Session, type SessionData } from './session.ts';
 import { verifyPassword } from './password.ts';
+import { withSpan, isOTELEnabled, SpanKind, SpanStatusCode } from '../telemetry/otel.ts';
 
 export interface AuthUser {
   id: string;
@@ -58,17 +59,39 @@ export class Auth {
    * Load user from session
    */
   async loadFromSession(): Promise<AuthUser | null> {
-    const userId = this.session.get<string>(this.options.sessionKey!);
+    if (!isOTELEnabled()) {
+      const userId = this.session.get<string>(this.options.sessionKey!);
 
-    if (!userId) {
-      return null;
+      if (!userId) {
+        return null;
+      }
+
+      if (this.options.userLoader) {
+        this.currentUser = await this.options.userLoader(userId);
+      }
+
+      return this.currentUser;
     }
 
-    if (this.options.userLoader) {
-      this.currentUser = await this.options.userLoader(userId);
-    }
+    return await withSpan('auth.loadFromSession', async (span) => {
+      span?.setAttribute('auth.method', 'session');
 
-    return this.currentUser;
+      const userId = this.session.get<string>(this.options.sessionKey!);
+
+      if (!userId) {
+        span?.setAttribute('auth.found', false);
+        return null;
+      }
+
+      span?.setAttribute('auth.user_id', userId);
+
+      if (this.options.userLoader) {
+        this.currentUser = await this.options.userLoader(userId);
+      }
+
+      span?.setAttribute('auth.found', this.currentUser !== null);
+      return this.currentUser;
+    }, { kind: SpanKind.INTERNAL });
   }
 
   /**
@@ -78,54 +101,131 @@ export class Auth {
     credentials: { email?: string; username?: string; password: string },
     findUser: (identifier: string) => Promise<{ id: string; passwordHash: string } | null>
   ): Promise<AuthUser | null> {
-    const identifier = credentials.email ?? credentials.username;
-    if (!identifier) {
-      throw new Error('Email or username is required');
+    if (!isOTELEnabled()) {
+      const identifier = credentials.email ?? credentials.username;
+      if (!identifier) {
+        throw new Error('Email or username is required');
+      }
+
+      const user = await findUser(identifier);
+      if (!user) {
+        return null;
+      }
+
+      const isValid = await this.options.passwordVerifier!(
+        credentials.password,
+        user.passwordHash
+      );
+
+      if (!isValid) {
+        return null;
+      }
+
+      // Load full user and store in session
+      if (this.options.userLoader) {
+        this.currentUser = await this.options.userLoader(user.id);
+      }
+
+      if (this.currentUser) {
+        this.session.set(this.options.sessionKey!, user.id);
+        await this.session.save();
+      }
+
+      return this.currentUser;
     }
 
-    const user = await findUser(identifier);
-    if (!user) {
-      return null;
-    }
+    return await withSpan('auth.authenticate', async (span) => {
+      const identifier = credentials.email ?? credentials.username;
+      span?.setAttribute('auth.method', 'credentials');
+      span?.setAttribute('auth.identifier_type', credentials.email ? 'email' : 'username');
 
-    const isValid = await this.options.passwordVerifier!(
-      credentials.password,
-      user.passwordHash
-    );
+      if (!identifier) {
+        span?.setStatus({ code: SpanStatusCode.ERROR, message: 'No identifier provided' });
+        throw new Error('Email or username is required');
+      }
 
-    if (!isValid) {
-      return null;
-    }
+      const user = await findUser(identifier);
+      if (!user) {
+        span?.setAttribute('auth.success', false);
+        span?.setAttribute('auth.failure_reason', 'user_not_found');
+        return null;
+      }
 
-    // Load full user and store in session
-    if (this.options.userLoader) {
-      this.currentUser = await this.options.userLoader(user.id);
-    }
+      const isValid = await this.options.passwordVerifier!(
+        credentials.password,
+        user.passwordHash
+      );
 
-    if (this.currentUser) {
-      this.session.set(this.options.sessionKey!, user.id);
-      await this.session.save();
-    }
+      if (!isValid) {
+        span?.setAttribute('auth.success', false);
+        span?.setAttribute('auth.failure_reason', 'invalid_password');
+        return null;
+      }
 
-    return this.currentUser;
+      // Load full user and store in session
+      if (this.options.userLoader) {
+        this.currentUser = await this.options.userLoader(user.id);
+      }
+
+      if (this.currentUser) {
+        this.session.set(this.options.sessionKey!, user.id);
+        await this.session.save();
+        span?.setAttribute('auth.success', true);
+        span?.setAttribute('auth.user_id', user.id);
+      } else {
+        span?.setAttribute('auth.success', false);
+        span?.setAttribute('auth.failure_reason', 'user_load_failed');
+      }
+
+      return this.currentUser;
+    }, { kind: SpanKind.INTERNAL });
   }
 
   /**
    * Login a user directly (after authentication)
    */
   async login(user: AuthUser): Promise<void> {
-    this.currentUser = user;
-    this.session.set(this.options.sessionKey!, user.id);
-    await this.session.save();
+    if (!isOTELEnabled()) {
+      this.currentUser = user;
+      this.session.set(this.options.sessionKey!, user.id);
+      await this.session.save();
+      return;
+    }
+
+    await withSpan('auth.login', async (span) => {
+      span?.setAttribute('auth.method', 'direct');
+      span?.setAttribute('auth.user_id', user.id);
+
+      this.currentUser = user;
+      this.session.set(this.options.sessionKey!, user.id);
+      await this.session.save();
+
+      span?.setAttribute('auth.success', true);
+    }, { kind: SpanKind.INTERNAL });
   }
 
   /**
    * Logout the current user
    */
   async logout(): Promise<void> {
-    this.currentUser = null;
-    this.session.delete(this.options.sessionKey!);
-    await this.session.save();
+    if (!isOTELEnabled()) {
+      this.currentUser = null;
+      this.session.delete(this.options.sessionKey!);
+      await this.session.save();
+      return;
+    }
+
+    await withSpan('auth.logout', async (span) => {
+      if (this.currentUser) {
+        span?.setAttribute('auth.user_id', this.currentUser.id);
+      }
+
+      this.currentUser = null;
+      this.session.delete(this.options.sessionKey!);
+      await this.session.save();
+
+      span?.setAttribute('auth.success', true);
+    }, { kind: SpanKind.INTERNAL });
   }
 
   /**
@@ -188,6 +288,39 @@ export function authMiddleware(options?: AuthOptions) {
       await auth.loadFromSession();
       req.state.set('auth', auth);
       req.state.set('user', auth.user);
+    }
+
+    return await next();
+  };
+}
+
+/**
+ * Context-based authentication middleware for Application
+ * This loads the user from the session into context state
+ */
+export function createAuthMiddleware(options?: AuthOptions) {
+  type MiddlewareContext = {
+    request: Request;
+    url: URL;
+    params: Record<string, string>;
+    query: URLSearchParams;
+    state: Map<string, unknown>;
+    header(name: string): string | null;
+    method: string;
+  };
+
+  return async (
+    ctx: MiddlewareContext,
+    next: () => Promise<Response>
+  ): Promise<Response> => {
+    // Get session from context state (populated by session middleware)
+    const session = ctx.state.get('session') as Session | undefined;
+
+    if (session) {
+      const auth = new Auth(session, options);
+      await auth.loadFromSession();
+      ctx.state.set('auth', auth);
+      ctx.state.set('user', auth.user);
     }
 
     return await next();

@@ -13,11 +13,18 @@ import type {
   WASMHostFunctionDescriptor,
   WASMFunctionSignature,
   WASMInstantiationOptions,
+  WASMCapability,
 } from './wasm_types.ts';
 import { WASMEvents } from './wasm_types.ts';
 import { EventEmitter } from '../plugin/events.ts';
 import { WASMMemoryManager } from './wasm_memory.ts';
 import { getLogger } from '../telemetry/logger.ts';
+import { WASI, type WASIOptions } from './wasm_wasi.ts';
+import {
+  WASMHostFunctionRegistry,
+  StandardHostFunctions,
+  type HostFunctionContext,
+} from './wasm_host_functions.ts';
 
 const logger = getLogger();
 
@@ -31,6 +38,17 @@ export interface ImportConfig {
   customImports?: Record<string, Record<string, unknown>>;
   includeHostFunctions?: boolean;
   allowedHostFunctions?: string[];
+  enableWASI?: boolean;
+  wasiOptions?: WASIOptions;
+  moduleId?: string;
+}
+
+/**
+ * WASM Executor Options
+ */
+export interface WASMExecutorOptions {
+  enableWASI?: boolean;
+  enableHostFunctionRegistry?: boolean;
 }
 
 /**
@@ -43,11 +61,29 @@ export class WASMExecutor {
   private events: EventEmitter;
   private memoryManager: WASMMemoryManager;
   private instances: Map<string, WebAssembly.Instance> = new Map();
+  private wasiInstances: Map<string, WASI> = new Map();
+  private hostFunctionRegistry: WASMHostFunctionRegistry;
+  private enableWASI: boolean;
+  private enableRegistry: boolean;
 
-  constructor(events: EventEmitter, memoryManager: WASMMemoryManager) {
+  constructor(
+    events: EventEmitter,
+    memoryManager: WASMMemoryManager,
+    options: WASMExecutorOptions = {}
+  ) {
     this.events = events;
     this.memoryManager = memoryManager;
-    this.registerDefaultHostFunctions();
+    this.enableWASI = options.enableWASI ?? true;
+    this.enableRegistry = options.enableHostFunctionRegistry ?? true;
+
+    // Initialize host function registry
+    this.hostFunctionRegistry = new WASMHostFunctionRegistry();
+
+    if (this.enableRegistry) {
+      this.registerStandardHostFunctions();
+    } else {
+      this.registerDefaultHostFunctions();
+    }
   }
 
   /**
@@ -61,6 +97,9 @@ export class WASMExecutor {
       memory: options.memory,
       table: options.table,
       includeHostFunctions: true,
+      enableWASI: this.enableWASI && (options.enableWASI ?? true),
+      wasiOptions: options.wasiOptions,
+      moduleId: module.id,
     });
 
     try {
@@ -75,9 +114,19 @@ export class WASMExecutor {
         module.memory = instance.exports.memory as WebAssembly.Memory;
       }
 
+      // Set memory on WASI instance if enabled
+      if (this.enableWASI && (options.enableWASI ?? true)) {
+        const wasi = this.wasiInstances.get(module.id);
+        if (wasi && module.memory) {
+          wasi.setMemory(module.memory);
+          await wasi.initializePreopens();
+        }
+      }
+
       this.events.emit(WASMEvents.MODULE_INSTANTIATED, {
         moduleId: module.id,
         exports: Object.keys(instance.exports),
+        wasi: this.wasiInstances.has(module.id),
       });
 
       logger.debug(`Instantiated WASM module: ${module.id}`);
@@ -330,8 +379,41 @@ export class WASMExecutor {
       imports.env.table = config.table;
     }
 
-    // Add host functions
-    if (config.includeHostFunctions !== false) {
+    // Add WASI imports if enabled
+    if (this.enableWASI && config.enableWASI !== false && config.moduleId) {
+      const wasi = new WASI(config.wasiOptions || {});
+      this.wasiInstances.set(config.moduleId, wasi);
+
+      const wasiImports = wasi.getImports();
+      for (const [module, funcs] of Object.entries(wasiImports)) {
+        if (!imports[module]) {
+          imports[module] = {};
+        }
+        Object.assign(imports[module] as object, funcs);
+      }
+
+      logger.debug(`Added WASI imports for module: ${config.moduleId}`);
+    }
+
+    // Add host functions from registry if enabled
+    if (this.enableRegistry && config.includeHostFunctions !== false && config.moduleId && config.memory) {
+      const registryImports = this.hostFunctionRegistry.getImports(
+        config.moduleId,
+        config.memory
+      );
+
+      for (const [module, funcs] of Object.entries(registryImports)) {
+        if (!imports[module]) {
+          imports[module] = {};
+        }
+        Object.assign(imports[module] as object, funcs);
+      }
+
+      logger.debug(`Added registry host functions for module: ${config.moduleId}`);
+    }
+
+    // Add legacy host functions (if registry is disabled)
+    if (!this.enableRegistry && config.includeHostFunctions !== false) {
       for (const [key, descriptor] of this.hostFunctions) {
         // Check if function is allowed
         if (config.allowedHostFunctions &&
@@ -408,7 +490,49 @@ export class WASMExecutor {
   }
 
   /**
-   * Register default host functions
+   * Register standard host functions using the registry
+   */
+  private registerStandardHostFunctions(): void {
+    // Register all standard host functions from the registry
+    for (const [module, functions] of Object.entries(StandardHostFunctions)) {
+      for (const [name, func] of Object.entries(functions)) {
+        this.hostFunctionRegistry.registerGlobal(
+          module,
+          name,
+          func as (ctx: HostFunctionContext, ...args: unknown[]) => unknown,
+          this.inferSignature(name)
+        );
+      }
+    }
+
+    logger.debug('Registered standard host functions via registry');
+  }
+
+  /**
+   * Infer function signature from name (basic heuristic)
+   */
+  private inferSignature(name: string): WASMFunctionSignature {
+    // Console functions take string pointer/length
+    if (name === 'log' || name === 'error' || name === 'warn' || name === 'info' || name === 'debug') {
+      return { params: ['i32', 'i32'], results: [] };
+    }
+
+    // Time functions return float64
+    if (name === 'now' || name === 'performance_now') {
+      return { params: [], results: ['f64'] };
+    }
+
+    // Math functions typically return float64
+    if (['random', 'floor', 'ceil', 'round', 'sqrt'].includes(name)) {
+      return { params: [], results: ['f64'] };
+    }
+
+    // Default signature
+    return { params: [], results: [] };
+  }
+
+  /**
+   * Register default host functions (legacy - used when registry is disabled)
    */
   private registerDefaultHostFunctions(): void {
     // Console functions
@@ -497,6 +621,21 @@ export class WASMExecutor {
    */
   removeInstance(moduleId: string): void {
     this.instances.delete(moduleId);
+    this.wasiInstances.delete(moduleId);
+  }
+
+  /**
+   * Get WASI instance for a module
+   */
+  getWASI(moduleId: string): WASI | undefined {
+    return this.wasiInstances.get(moduleId);
+  }
+
+  /**
+   * Get host function registry
+   */
+  getRegistry(): WASMHostFunctionRegistry {
+    return this.hostFunctionRegistry;
   }
 
   /**
@@ -535,8 +674,15 @@ export class WASMExecutor {
    */
   reset(): void {
     this.instances.clear();
+    this.wasiInstances.clear();
     this.hostFunctions.clear();
-    this.registerDefaultHostFunctions();
+
+    if (this.enableRegistry) {
+      // Note: Registry is persistent and doesn't need resetting
+      // Only re-register if needed
+    } else {
+      this.registerDefaultHostFunctions();
+    }
   }
 }
 

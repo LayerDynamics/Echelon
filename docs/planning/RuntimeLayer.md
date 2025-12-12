@@ -66,11 +66,11 @@ Layer 0 is the **foundational runtime** upon which the entire Echelon stack is b
 
 This layer defines:
 
-- **What executes our code** (Deno/V8)
-- **How code is loaded and run** (ES Modules, TypeScript compilation)
-- **Memory and resource management** (V8 GC, isolates)
+- **What executes our code** (Deno/V8, WebAssembly)
+- **How code is loaded and run** (ES Modules, TypeScript compilation, WASM modules)
+- **Memory and resource management** (V8 GC, isolates, WASM linear memory)
 - **Concurrency model** (Event loop, async/await)
-- **Security boundaries** (Permission system)
+- **Security boundaries** (Permission system, WASM sandboxing)
 - **Process lifecycle** (Startup, shutdown, signals)
 
 ---
@@ -138,6 +138,13 @@ Echelon.Runtime.V8
 │   ├── Isolated execution contexts
 │   ├── Separate heap per isolate
 │   └── Used for: Workers, Deno Deploy edge
+│
+├── WebAssembly Support
+│   ├── Native WASM execution (TurboFan backend)
+│   ├── Streaming compilation for large modules
+│   ├── Memory: Linear memory model (separate from JS heap)
+│   ├── Performance: Near-native execution speed
+│   └── See: WASMIntegrationAsACoreFeature.md for details
 │
 └── Performance Characteristics
     ├── Startup time: ~50-100ms
@@ -208,12 +215,19 @@ Echelon.Runtime.Modules
 │   ├── Remote modules: Downloaded once, cached
 │   ├── Lock file: deno.lock (integrity verification)
 │   ├── Vendoring: deno vendor (offline support)
-│   └── Permissions: Checked at load time
+│   ├── Permissions: Checked at load time
+│   └── WASM modules: Dynamic import of .wasm files (Deno 2.1+)
 │
-└── Module Graph
-    ├── Static analysis of imports
-    ├── Tree-shaking (via bundler)
-    └── Circular dependency handling
+├── Module Graph
+│   ├── Static analysis of imports
+│   ├── Tree-shaking (via bundler)
+│   └── Circular dependency handling
+│
+└── WebAssembly Module Support
+    ├── Native import: import wasm from "./module.wasm"
+    ├── Streaming compilation for URL sources
+    ├── Multiple source types: file, url, bytes, base64
+    └── See: framework/runtime/wasm_module_loader.ts
 ```
 
 ---
@@ -337,8 +351,9 @@ Echelon.Runtime.Workers
 │
 └── Use Cases in Echelon
     ├── CPU-intensive: Image processing, crypto
-    ├── Isolation: Untrusted code execution
-    └── Parallelism: Batch processing
+    ├── Isolation: Untrusted code execution (including WASM)
+    ├── Parallelism: Batch processing
+    └── WASM Execution: High-performance plugins in isolated workers
 ```
 
 ---
@@ -385,7 +400,9 @@ Echelon.Runtime.Permissions
     ├── Checked at runtime, not compile time
     ├── Throws PermissionDenied error
     ├── Cannot escalate in child workers
-    └── Immutable after process start (mostly)
+    ├── Immutable after process start (mostly)
+    └── WASM Sandboxing: Complementary isolation layer
+        └── See: WASMIntegrationAsACoreFeature.md (Security Model)
 ```
 
 ### 0.3.2 Echelon Permission Strategy
@@ -477,10 +494,33 @@ Echelon.Runtime.APIs
 │   ├── Deno.memoryUsage()
 │   └── Deno.pid
 │
-└── Signals
-    └── Deno.addSignalListener(signal, handler)
-        ├── SIGINT, SIGTERM handling
-        └── Graceful shutdown
+├── Signals
+│   └── Deno.addSignalListener(signal, handler)
+│       ├── SIGINT, SIGTERM handling
+│       └── Graceful shutdown
+│
+└── WebAssembly (CRITICAL/REQUIRED)
+    ├── WebAssembly.compile(bytes)
+    │   └── Compile WASM module (async)
+    ├── WebAssembly.compileStreaming(source)
+    │   └── Streaming compilation (Deno 2.1+, 40% faster)
+    ├── WebAssembly.instantiate(module, imports)
+    │   └── Create module instance
+    ├── WebAssembly.Module
+    │   └── Compiled WASM module
+    ├── WebAssembly.Instance
+    │   └── Instantiated module with exports
+    ├── WebAssembly.Memory
+    │   └── Linear memory buffer
+    └── WebAssembly.Table
+        └── Function reference table
+
+    Echelon WASM Runtime:
+    └── framework/runtime/wasm_runtime.ts
+        ├── WASMRuntimeCore: Orchestration
+        ├── Module loading, caching, execution
+        ├── Sandbox manager with capability-based security
+        └── See: WASMIntegrationAsACoreFeature.md
 ```
 
 ### 0.4.2 Web Standard APIs
@@ -560,26 +600,31 @@ Echelon.Runtime.Startup
 │   └── main.ts:
 │       // 1. Load configuration
 │       const config = await loadConfig();
-│       
+│
 │       // 2. Check permissions
 │       await checkPermissions();
-│       
+│
 │       // 3. Initialize telemetry
 │       const telemetry = await initTelemetry(config);
-│       
+│
 │       // 4. Open database
 │       const kv = await Deno.openKv();
-│       
-│       // 5. Initialize services
+│
+│       // 5. Initialize WASM runtime (if enabled)
+│       const wasmRuntime = config.enableWasm
+│         ? await initWasmRuntime(config.wasm)
+│         : undefined;
+│
+│       // 6. Initialize services
 │       const services = await initServices(config, kv);
-│       
-│       // 6. Build application
-│       const app = createApplication(config, services);
-│       
-│       // 7. Register routes
+│
+│       // 7. Build application
+│       const app = createApplication(config, services, wasmRuntime);
+│
+│       // 8. Register routes
 │       registerRoutes(app);
-│       
-│       // 8. Start server
+│
+│       // 9. Start server
 │       await app.serve();
 │
 └── Startup Metrics
@@ -620,21 +665,26 @@ Echelon.Runtime.Shutdown
 │         async shutdown(): Promise<void> {
 │           // 1. Stop server
 │           await this.server.shutdown();
-│           
+│
 │           // 2. Stop job workers
 │           await this.jobWorker.stop();
-│           
-│           // 3. Flush telemetry
+│
+│           // 3. Shutdown WASM runtime
+│           if (this.wasm) {
+│             await this.wasm.shutdown();
+│           }
+│
+│           // 4. Flush telemetry
 │           await this.telemetry.flush();
-│           
-│           // 4. Close KV
+│
+│           // 5. Close KV
 │           this.kv.close();
-│           
-│           // 5. Run custom shutdown hooks
+│
+│           // 6. Run custom shutdown hooks
 │           for (const hook of this.shutdownHooks) {
 │             await hook();
 │           }
-│           
+│
 │           console.log("Shutdown complete");
 │         }
 │       }
@@ -765,7 +815,10 @@ Echelon.Runtime.Metrics
 │   ├── v8_heap_used_bytes: Gauge
 │   ├── v8_heap_total_bytes: Gauge
 │   ├── v8_external_bytes: Gauge
-│   └── process_memory_rss_bytes: Gauge
+│   ├── process_memory_rss_bytes: Gauge
+│   ├── wasm_memory_allocated_bytes: Gauge
+│   ├── wasm_memory_used_bytes: Gauge
+│   └── wasm_modules_loaded: Gauge
 │
 ├── Event Loop Metrics
 │   ├── event_loop_lag_ms: Histogram
@@ -804,11 +857,19 @@ Echelon.Runtime.Events
 │   ├── module.load
 │   └── permission.check
 │
+├── WASM Events
+│   ├── wasm.runtime.init
+│   ├── wasm.module.loaded
+│   ├── wasm.exec.start / wasm.exec.complete
+│   ├── wasm.sandbox.created
+│   └── wasm.sandbox.violation
+│
 └── Event Emission
     └── runtime.emit('ready', {
           startupDuration: 150,
           modulesLoaded: 47,
-          memoryUsed: 52428800
+          memoryUsed: 52428800,
+          wasmEnabled: true
         })
 ```
 
@@ -918,7 +979,17 @@ interface EchelonRuntime {
     memoryUsage(): MemoryUsage;
     cpuUsage(): CpuUsage;
   };
-  
+
+  // WASM Runtime (CRITICAL/REQUIRED)
+  readonly wasm?: {
+    loadModule(source: WASMSource): Promise<WASMModule>;
+    instantiate(moduleId: string, options?: WASMInstantiationOptions): Promise<void>;
+    execute<T>(moduleId: string, functionName: string, args: unknown[]): Promise<WASMExecutionResult<T>>;
+    createSandbox(config: WASMSandboxConfig): WASMSandbox;
+    generator: WASMGenerator;
+    getStats(): WASMRuntimeStats;
+  };
+
   // Lifecycle
   onStart(handler: () => Promise<void>): void;
   onReady(handler: () => void): void;
@@ -966,6 +1037,10 @@ declare const runtime: EchelonRuntime;
 | Process Lifecycle | Signals, startup | Lifecycle hooks |
 | Memory Management | V8 GC | Monitoring only |
 | Workers | Web Workers | Worker pool abstraction |
+| WebAssembly Execution | WebAssembly APIs | WASMRuntimeCore (Layer 0) |
+| WASM Module Loading | Native imports (Deno 2.1+) | Multi-source loader + caching |
+| WASM Sandboxing | Linear memory isolation | Capability-based sandbox manager |
+| WASM Code Generation | External toolchains | Built-in generator (TS/Rust) |
 
 ### Key Differences from Traditional Frameworks
 
@@ -979,9 +1054,12 @@ declare const runtime: EchelonRuntime;
 | Module Format | CommonJS/various | ES Modules only |
 | Database | PostgreSQL/MySQL | Deno KV (built-in) |
 | Async Model | Threads/GIL | Event loop + Workers |
+| WebAssembly | External runtime (WASI-SDK) | Native V8 support + Runtime |
 
 ---
 
 The Runtime layer (Layer 0) is **implicit** in traditional frameworks—you install Python + Gunicorn, or Ruby + Puma. With Deno, the runtime is **unified**—one binary that includes the language, compiler, HTTP server, and package manager. Echelon leverages this tight integration for superior developer experience and performance.
+
+**WebAssembly is a CRITICAL/REQUIRED component of Layer 0**, providing near-native performance for computationally intensive tasks, secure sandboxing for untrusted code execution, and the ability to run code compiled from multiple languages (TypeScript, Rust, C/C++, Go, etc.). The WASM runtime is deeply integrated with Echelon's architecture—see `WASMIntegrationAsACoreFeature.md` for comprehensive details on implementation, use cases, and best practices.
 
 **Layers 1-18 build upon this runtime foundation, with Layer 1 (HTTP/Server) being the first framework-specific abstraction layer.**

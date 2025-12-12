@@ -17,7 +17,8 @@ import { getTracer, Tracer } from './telemetry/tracing.ts';
 import { Lifecycle } from './runtime/lifecycle.ts';
 import { WASMRuntimeCore, type WASMRuntimeConfig } from './runtime/wasm_runtime.ts';
 import { WASMGeneratorCore } from './plugin/wasm_generator.ts';
-import { Debugger, getDebugger, DebugLevel, DebugModule } from './debugger/mod.ts';
+import { Debugger, getDebugger, DebugLevel, DebugModule, attachOTelBridge, type DebuggerOTelBridge } from './debugger/mod.ts';
+import { isOTELEnabled, setRouteAttribute, recordSpanException } from './telemetry/otel.ts';
 import type { Context, Middleware, Next, RouteHandler, Handler } from './http/types.ts';
 import { EchelonRequest } from './http/request.ts';
 import { EchelonResponse } from './http/response.ts';
@@ -35,6 +36,7 @@ export interface ApplicationOptions {
   configPath?: string;
   wasmConfig?: WASMRuntimeConfig;
   enableWasm?: boolean;
+  wasm?: WASMRuntimeConfig; // Alias for wasmConfig
 }
 
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS';
@@ -62,6 +64,7 @@ export class Application {
 
   // Debugger
   private debugger: Debugger;
+  private otelBridge: DebuggerOTelBridge | null = null;
 
   constructor(options: ApplicationOptions = {}) {
     this.config = new Config(options.config);
@@ -83,15 +86,21 @@ export class Application {
       log: (message, context) => this.logger.info(message, context as Record<string, unknown>),
     });
 
-    // WASM configuration
+    // WASM configuration (support both wasmConfig and wasm)
     this.wasmEnabled = options.enableWasm ?? true;
     if (this.wasmEnabled) {
-      this.wasmRuntime = new WASMRuntimeCore(this.events, this.lifecycle, options.wasmConfig);
+      const wasmConfig = options.wasm ?? options.wasmConfig;
+      this.wasmRuntime = new WASMRuntimeCore(this.events, this.lifecycle, wasmConfig);
       this.wasmGenerator = new WASMGeneratorCore(this.events);
     }
 
     // Debugger initialization
     this.debugger = getDebugger();
+
+    // OpenTelemetry bridge - convert debugger events to OTEL spans
+    if (isOTELEnabled()) {
+      this.otelBridge = attachOTelBridge(this.debugger);
+    }
 
     // Setup default metrics
     this.setupMetrics();
@@ -459,6 +468,11 @@ export class Application {
           data: { pattern: match.route.pattern, params: match.params },
         });
 
+        // Set route attribute on OTEL span (when OTEL_DENO=true)
+        if (isOTELEnabled()) {
+          setRouteAttribute(match.route.pattern.pathname, method);
+        }
+
         // Create context with all required properties
         const state = new Map<string, unknown>();
         state.set('debugRequestId', requestId);
@@ -480,8 +494,11 @@ export class Application {
           const timing = this.debugger.startTiming('route-handler', DebugModule.CONTROLLER, requestId);
 
           // Create EchelonRequest and EchelonResponse for the handler
-          const req = new EchelonRequest(ctx.request);
-          req.setParams(ctx.params);
+          // IMPORTANT: Pass the state from middleware context so session/auth data is available
+          const req = new EchelonRequest(ctx.request, {
+            params: ctx.params,
+            state: ctx.state,
+          });
           const res = new EchelonResponse();
 
           const result = await match.handler(req, res);
@@ -507,6 +524,11 @@ export class Application {
 
         return response;
       } catch (error) {
+        // Record exception on OTEL span
+        if (isOTELEnabled()) {
+          recordSpanException(error as Error);
+        }
+
         this.logger.error('Request error', error as Error, { method, path });
         this.debugger.error(DebugModule.HTTP, 'Request error', error as Error, requestId);
         this.debugger.endRequest(requestId, 500);
@@ -527,6 +549,26 @@ export class Application {
       name: 'process_start_time_seconds',
       help: 'Start time of the process since unix epoch in seconds',
     }).set(Date.now() / 1000);
+  }
+
+  /**
+   * Get WASM runtime (for direct access to WASM features)
+   */
+  get wasm(): WASMRuntimeCore {
+    if (!this.wasmRuntime) {
+      throw new Error('WASM runtime is not enabled. Set enableWasm: true in ApplicationOptions.');
+    }
+    return this.wasmRuntime;
+  }
+
+  /**
+   * Get WASM generator (for code generation)
+   */
+  get generator(): WASMGeneratorCore {
+    if (!this.wasmGenerator) {
+      throw new Error('WASM generator is not available. WASM must be enabled.');
+    }
+    return this.wasmGenerator;
   }
 }
 
